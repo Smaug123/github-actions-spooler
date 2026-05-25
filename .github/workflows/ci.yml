@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CACHIX_CACHE: smaug123
+
+jobs:
+  rust:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
+    - name: Enable Nix cache
+      uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+    - name: Run clippy
+      run: |
+        nix develop --command cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Run build
+      run: |
+        nix develop --command cargo build --verbose
+
+    - name: Run tests
+      run: |
+        nix develop --command cargo test --verbose
+
+    - name: Run fmt
+      run: |
+        nix develop --command cargo fmt --check
+
+    - name: Run cargo doc
+      run: |
+        nix develop --command env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
+    - name: Enable Nix cache
+      uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+    - name: Use Cachix
+      uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+      with:
+        name: ${{ env.CACHIX_CACHE }}
+
+    - name: Build Nix package
+      run: |
+        nix build .#packages.x86_64-linux.default --print-build-logs
+
+  all-required-checks-complete:
+    if: ${{ always() }}
+    needs: [nix-build, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: G-Research/common-actions/check-required-lite@2b7dc49cb14f3344fbe6019c14a31165e258c059
+        with:
+          needs-context: ${{ toJSON(needs) }}
