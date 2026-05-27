@@ -4,69 +4,55 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { nixpkgs, flake-utils, ... }:
-    let
-      inherit (nixpkgs) lib;
+  outputs = { nixpkgs, flake-utils, crane, rust-overlay, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = (import nixpkgs { inherit system; }).extend (import rust-overlay);
 
-      mkPkgs = system: import nixpkgs { inherit system; };
-
-      mkSource = pkgs:
-        let
-          sourceRoot = toString ./.;
-        in
-        pkgs.lib.cleanSourceWith {
-          src = ./.;
-          filter = path: type:
-            let
-              rel = lib.removePrefix "${sourceRoot}/" (toString path);
-            in
-            rel == "Cargo.lock"
-            || rel == "Cargo.toml"
-            || rel == "src"
-            || lib.hasPrefix "src/" rel
-            || rel == "tests"
-            || lib.hasPrefix "tests/" rel;
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "rust-src" "clippy" "rustfmt" ];
         };
 
-      # Only evaluate the package derivation if Cargo.lock exists. Otherwise
-      # the devshell would fail to evaluate on first use, before we've had a
-      # chance to generate the lockfile.
-      hasLockfile = builtins.pathExists ./Cargo.lock;
+        craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
-      mkSpool = pkgs:
-        pkgs.rustPlatform.buildRustPackage {
+        src = craneLib.cleanCargoSource ./.;
+
+        commonArgs = {
+          inherit src;
+          strictDeps = true;
           pname = "gh-webhook-spool";
           version = "0.1.0";
-          src = mkSource pkgs;
-          cargoLock.lockFile = ./Cargo.lock;
+        };
+
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+          cargoExtraArgs = "--locked";
+        });
+
+        gh-webhook-spool = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "--locked";
           meta = {
             description = "Tiny HMAC-verifying GitHub webhook spooler.";
             mainProgram = "gh-webhook-spool";
           };
-        };
-    in
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = mkPkgs system;
+        });
       in
       {
-        packages = lib.optionalAttrs hasLockfile (
-          let spool = mkSpool pkgs; in {
-            default = spool;
-            gh-webhook-spool = spool;
-          }
-        );
+        packages = {
+          default = gh-webhook-spool;
+          gh-webhook-spool = gh-webhook-spool;
+        };
 
-        devShells.default = pkgs.mkShell {
+        devShells.default = craneLib.devShell {
           packages = [
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.clippy
-            pkgs.rustfmt
             pkgs.git
-            pkgs.pkg-config
           ];
         };
       });
