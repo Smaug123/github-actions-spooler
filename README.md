@@ -234,11 +234,20 @@ situations:
 Because authenticated, allowlisted jobs are dropped on the floor if
 nothing replays them, **operators are expected to run a separate
 failed-delivery monitor** alongside this binary. The minimum viable
-shape is a process that periodically lists failed deliveries via the
-[`POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts`](https://docs.github.com/en/rest/repos/webhooks)
-API (or the equivalent organisation-scoped endpoint) and redelivers
-anything that's still failed. Without that, a 5xx from this binary
-silently loses the workflow job. The spool itself is idempotent on
-`workflow_job_id` (replay-safe), so a redelivery monitor that
-over-delivers is harmless.
+shape is a process that periodically does two steps:
+
+1. **List** recent deliveries with
+   [`GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries`](https://docs.github.com/en/rest/repos/webhooks/repo-deliveries#list-deliveries-for-a-repository-webhook)
+   (paginated; each item carries an `id` plus a `status` / `status_code`),
+   or the organisation-scoped
+   `GET /orgs/{org}/hooks/{hook_id}/deliveries`.
+2. For each delivery whose status indicates failure, **redeliver** it with
+   [`POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts`](https://docs.github.com/en/rest/webhooks/repo-deliveries#redeliver-a-delivery-for-a-repository-webhook)
+   (or the equivalent organisation-scoped endpoint).
+
+Note that the `attempts` endpoint only *redelivers a single delivery* — it
+does not list anything, so the list step above is required first. Without
+this monitor, a 5xx from this binary silently loses the workflow job. The
+spool itself is idempotent on `workflow_job_id` (replay-safe), so a
+redelivery monitor that over-delivers is harmless.
 

@@ -59,6 +59,14 @@
 // every one of those checks (the per-platform helpers below are #[cfg(unix)]
 // gated). Refuse to compile rather than ship a binary that quietly turns off
 // its own filesystem defences.
+//
+// On macOS the mode bits alone are not enough: an ACL can grant another local
+// principal access to an object whose st_mode is 0600/0700. So on Darwin every
+// mode-bit check below is paired with an ACL check (see `darwin_acl`) that
+// rejects any object — secret file, spool dirs, their ancestors, and enqueued
+// files — carrying an access-granting ALLOW ACE. DENY ACEs are tolerated:
+// macOS ships default `deny delete` ACLs on system directories the ancestor
+// walk crosses. (Linux POSIX.1e ACLs are a separate, out-of-scope gap.)
 #[cfg(not(unix))]
 compile_error!(
     "gh-webhook-spool requires a Unix target: the secret-file and spool-dir \
@@ -346,6 +354,7 @@ fn read_secret_file(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error + 
 fn read_secret_open_fd(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
 
     let mut f = std::fs::OpenOptions::new()
         .read(true)
@@ -406,6 +415,9 @@ fn read_secret_open_fd(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error
         )
         .into());
     }
+    // On Darwin, the 0600 mode check above can be bypassed by an ACL. Check
+    // via the same fd we fstat'd, so the check is bound to this inode.
+    darwin_acl::reject_grant_acl_fd(f.as_raw_fd(), &format!("secret file {}", path.display()))?;
     let mut bytes = Vec::with_capacity(md.size() as usize);
     (&mut f)
         .take(MAX_SECRET_FILE_BYTES + 1)
@@ -504,6 +516,8 @@ fn verify_dir_secure(path: &Path) -> Result<(), Box<dyn std::error::Error + Send
         )
         .into());
     }
+    // The mode check above is bypassable by an ACL on Darwin; reject one here.
+    darwin_acl::reject_grant_acl_path_nofollow(path)?;
     Ok(())
 }
 
@@ -546,6 +560,10 @@ fn verify_ancestor_chain(path: &Path) -> Result<(), Box<dyn std::error::Error + 
             )
             .into());
         }
+        // A write-granting ACL on an ancestor lets another user swap the tree;
+        // the write-bit check above misses it on Darwin. ALLOW-only, so the
+        // default `deny delete` ACLs on macOS system dirs don't trip this.
+        darwin_acl::reject_grant_acl_path_nofollow(current)?;
         let Some(parent) = current.parent() else {
             break;
         };
@@ -564,9 +582,162 @@ fn current_euid() -> u32 {
     unsafe { geteuid() }
 }
 
+// On macOS, POSIX mode bits are not the whole story: an ACL can grant another
+// local principal read/write to an object whose st_mode is 0600/0700, silently
+// defeating the owner+mode checks the rest of this file relies on. These
+// helpers reject any object carrying an access-granting (ALLOW) ACE. DENY ACEs
+// are tolerated on purpose — macOS ships default `deny delete` ACLs on system
+// directories (e.g. /Users) that the ancestor walk crosses, and a DENY only
+// further restricts access. Reached via inline FFI into libSystem, the same
+// way `geteuid` above is, rather than pulling in a crate.
+#[cfg(target_os = "macos")]
+mod darwin_acl {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::RawFd;
+    use std::path::Path;
+
+    // acl_t / acl_entry_t are opaque pointers; acl_type_t / acl_tag_t are
+    // 32-bit ints (see <sys/acl.h>).
+    type AclT = *mut c_void;
+    type AclEntryT = *mut c_void;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    // Darwin's ACL_NEXT_ENTRY is -1, NOT 1. The 1 value is the FreeBSD
+    // convention; on macOS <sys/acl.h> defines `ACL_FIRST_ENTRY = 0,
+    // ACL_NEXT_ENTRY = -1`. Passing 1 here would request the entry at index
+    // 1 (a non-portable "index" extension), not the next one.
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: i32 = 1;
+    // <errno.h>: acl_get_fd / acl_get_link_np return NULL and set errno to
+    // ENOENT when the object simply has no ACL of the requested type. Any
+    // other errno means the lookup itself failed and we must fail closed.
+    const ENOENT: i32 = 2;
+
+    extern "C" {
+        fn acl_get_fd(fd: c_int) -> AclT;
+        fn acl_get_link_np(path: *const c_char, acl_type: c_int) -> AclT;
+        fn acl_get_entry(acl: AclT, entry_id: c_int, entry_p: *mut AclEntryT) -> c_int;
+        fn acl_get_tag_type(entry: AclEntryT, tag_p: *mut i32) -> c_int;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+
+    // Interpret an ACL handle from acl_get_fd / acl_get_link_np:
+    //   Ok(true)  -> holds at least one access-granting ALLOW entry.
+    //   Ok(false) -> object has no extended ACL (NULL + errno ENOENT).
+    //   Err(..)   -> the lookup itself failed; callers MUST fail closed
+    //                rather than accept an object whose ACL couldn't be read.
+    // A NULL handle is overloaded on macOS: it signals both "no ACL" (ENOENT)
+    // and genuine errors (ENOMEM/EACCES/EINVAL/...), so reading errno is the
+    // only way to tell them apart. errno is read immediately after the null
+    // check — nothing between the FFI call and here touches it. Always frees a
+    // non-NULL acl.
+    unsafe fn acl_grants_access(
+        acl: AclT,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if acl.is_null() {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(ENOENT) {
+                return Ok(false);
+            }
+            return Err(format!("ACL lookup failed: {err}").into());
+        }
+        let mut found_allow = false;
+        let mut entry: AclEntryT = std::ptr::null_mut();
+        // On macOS (POSIX.1e draft 17) acl_get_entry returns 0 when it yields
+        // an entry and -1 on exhaustion or error — NOT the FreeBSD 1/0/-1
+        // convention. Continue while it returns 0; stop on anything else.
+        let mut entry_id = ACL_FIRST_ENTRY;
+        while acl_get_entry(acl, entry_id, &mut entry) == 0 {
+            entry_id = ACL_NEXT_ENTRY;
+            let mut tag: i32 = 0;
+            if acl_get_tag_type(entry, &mut tag) == 0 && tag == ACL_EXTENDED_ALLOW {
+                found_allow = true;
+                break;
+            }
+        }
+        acl_free(acl);
+        Ok(found_allow)
+    }
+
+    pub fn reject_grant_acl_fd(
+        fd: RawFd,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // acl_get_fd returns the ACL_TYPE_EXTENDED ACL for the open fd.
+        let grants = unsafe { acl_grants_access(acl_get_fd(fd)) }.map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("{label}: {e}").into() },
+        )?;
+        if grants {
+            return Err(format!(
+                "{label} carries an access-granting (ALLOW) ACL; clear it with `chmod -N` — \
+                 this binary's filesystem security relies on POSIX mode bits only, and an ACL \
+                 can grant another local user access despite a 0600/0700 mode"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn reject_grant_acl_path_nofollow(
+        path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let cpath = CString::new(path.as_os_str().as_bytes()).map_err(
+            |_| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("path {} contains an interior NUL byte", path.display()).into()
+            },
+        )?;
+        // acl_get_link_np does not follow a final symlink, matching the
+        // symlink_metadata / O_NOFOLLOW posture elsewhere.
+        let grants =
+            unsafe { acl_grants_access(acl_get_link_np(cpath.as_ptr(), ACL_TYPE_EXTENDED)) }
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("{}: {e}", path.display()).into()
+                })?;
+        if grants {
+            return Err(format!(
+                "{} carries an access-granting (ALLOW) ACL; clear it with `chmod -N {}` — \
+                 this binary's filesystem security relies on POSIX mode bits only",
+                path.display(),
+                path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+// On non-Darwin Unix targets the spool relies on POSIX mode bits alone. Linux
+// POSIX.1e ACLs can also grant access despite the mode bits, but that's a
+// separate gap the review did not raise and is intentionally out of scope; for
+// now these no-ops keep the call sites target-agnostic.
+#[cfg(not(target_os = "macos"))]
+mod darwin_acl {
+    use std::os::unix::io::RawFd;
+    use std::path::Path;
+
+    #[inline]
+    pub fn reject_grant_acl_fd(
+        _fd: RawFd,
+        _label: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    #[inline]
+    pub fn reject_grant_acl_path_nofollow(
+        _path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
 async fn sweep_tmp(tmp: &Path) -> io::Result<()> {
     let mut entries = fs::read_dir(tmp).await?;
     let mut swept_any = false;
+    let mut failures = 0usize;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         match fs::remove_file(&path).await {
@@ -574,11 +745,17 @@ async fn sweep_tmp(tmp: &Path) -> io::Result<()> {
                 eprintln!("swept stale tmp file: {}", path.display());
                 swept_any = true;
             }
-            Err(e) => eprintln!(
-                "warning: failed to sweep stale tmp file {}: {}",
-                path.display(),
-                e
-            ),
+            Err(e) => {
+                // remove_file also fails on a leftover subdirectory
+                // (EISDIR/EPERM), which is exactly the unremovable case we
+                // must not start past.
+                eprintln!(
+                    "error: failed to sweep stale tmp entry {}: {}",
+                    path.display(),
+                    e
+                );
+                failures += 1;
+            }
         }
     }
     if swept_any {
@@ -591,6 +768,17 @@ async fn sweep_tmp(tmp: &Path) -> io::Result<()> {
         })
         .await
         .map_err(io::Error::other)??;
+    }
+    // A leftover tmp/{id}.job (or a stale directory) we couldn't remove would
+    // pin every future delivery for that id at InFlight/503 until manual
+    // cleanup. Refuse to start with an incompletely-swept tmp/ rather than
+    // serve in that state.
+    if failures > 0 {
+        return Err(io::Error::other(format!(
+            "{failures} stale entr{} in {} could not be removed; clear tmp/ manually before restarting",
+            if failures == 1 { "y" } else { "ies" },
+            tmp.display()
+        )));
     }
     Ok(())
 }
@@ -965,6 +1153,18 @@ pub async fn enqueue(
         }
         Err(e) => return Err(e),
     };
+
+    // Defence-in-depth on Darwin: tmp/ is verified ACL-free at startup so a
+    // freshly created file can't inherit a grant, but an ACL on this fd would
+    // expose the signed body — reject and clean up if one somehow appears.
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(e) = darwin_acl::reject_grant_acl_fd(f.as_raw_fd(), "enqueued spool file") {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(io::Error::other(e));
+        }
+    }
 
     // From here on, any error must unlink tmp_path before returning. A leaked
     // tmp/{id} would cause every future retry for the same workflow_job_id to
@@ -1495,12 +1695,18 @@ mod tests {
     async fn workflow_job_without_id_field_is_acknowledged() {
         let (_dir, root) = fresh_spool().await;
         let state = state_with(&root, &[42], &[]);
-        // `private: true` so the private-repo gate doesn't ack first — we
-        // want to exercise the "missing workflow_job.id" path specifically.
+        // `private: true` AND `visibility: "private"` so the private-repo gate
+        // doesn't ack first — we want to exercise the "missing
+        // workflow_job.id" path specifically.
         let body = serde_json::to_vec(&serde_json::json!({
             "action": "queued",
             "workflow_job": { "labels": ["self-hosted"] },
-            "repository": { "id": 42, "full_name": "octo/cat", "private": true }
+            "repository": {
+                "id": 42,
+                "full_name": "octo/cat",
+                "private": true,
+                "visibility": "private"
+            }
         }))
         .unwrap();
         let sig = sign(&state.secret, &body);
@@ -1703,6 +1909,69 @@ mod tests {
         std::fs::create_dir(&ok).unwrap();
         std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o700)).unwrap();
         verify_dir_secure(&ok).expect("0700 dir owned by us should verify");
+    }
+
+    // Exercises the real Darwin ACL helpers. Only compiled on macOS — on
+    // other targets `darwin_acl` is the no-op stub and ACLs/`chmod +a` don't
+    // exist. These guard the FFI convention bug where the entry-iteration
+    // loop silently never ran (acl_get_entry returns 0 not 1 on macOS, and
+    // ACL_NEXT_ENTRY is -1 not 1), which made every ACL check pass.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn darwin_acl_rejects_allow_and_tolerates_deny() {
+        use std::os::unix::io::AsRawFd;
+        use std::process::Command;
+
+        fn set_acl(path: &Path, ace: &str) {
+            let status = Command::new("/bin/chmod")
+                .arg("+a")
+                .arg(ace)
+                .arg(path)
+                .status()
+                .expect("run /bin/chmod +a");
+            assert!(status.success(), "chmod +a {ace:?} failed");
+        }
+
+        let dir = tempdir_like::TempDir::new("acl").unwrap();
+        let root = dir.path();
+
+        // No ACL -> passes (both path and fd variants).
+        let plain = root.join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        darwin_acl::reject_grant_acl_path_nofollow(&plain)
+            .expect("file with no ACL must pass the path check");
+        {
+            let f = std::fs::File::open(&plain).unwrap();
+            darwin_acl::reject_grant_acl_fd(f.as_raw_fd(), "plain")
+                .expect("file with no ACL must pass the fd check");
+        }
+
+        // An access-granting ALLOW ACE -> rejected. This is the assertion
+        // that fails against the pre-fix code (the loop never ran, so the
+        // ALLOW ACE was never seen) and passes after.
+        let allow = root.join("allow");
+        std::fs::write(&allow, b"x").unwrap();
+        set_acl(&allow, "everyone allow read");
+        assert!(
+            darwin_acl::reject_grant_acl_path_nofollow(&allow).is_err(),
+            "an everyone-allow-read ACE must be rejected (path)"
+        );
+        {
+            let f = std::fs::File::open(&allow).unwrap();
+            assert!(
+                darwin_acl::reject_grant_acl_fd(f.as_raw_fd(), "allow").is_err(),
+                "an everyone-allow-read ACE must be rejected (fd)"
+            );
+        }
+
+        // A DENY-only ACE -> tolerated. macOS ships default `deny delete`
+        // ACLs on system dirs the ancestor walk crosses; a DENY only further
+        // restricts access, so it must not trip the check.
+        let deny = root.join("deny");
+        std::fs::write(&deny, b"x").unwrap();
+        set_acl(&deny, "everyone deny delete");
+        darwin_acl::reject_grant_acl_path_nofollow(&deny)
+            .expect("a deny-only ACE must be tolerated");
     }
 
     // A tiny in-tree replacement for `tempfile` to avoid an extra dep just
