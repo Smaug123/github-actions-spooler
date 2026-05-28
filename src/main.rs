@@ -192,13 +192,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("warning: binding {addr} per ALLOW_NON_LOOPBACK_BIND=1");
     }
 
+    // The route the handler is mounted on. Configurable so the deployment can
+    // match whatever path the GitHub App's webhook URL uses (e.g. a hard-to-
+    // guess `/github/<uuid>`); the path is not a security boundary — the HMAC
+    // is — but matching it avoids a reverse-proxy rewrite. axum requires a
+    // leading slash, so reject anything else loudly at startup.
+    let webhook_path = std::env::var("WEBHOOK_PATH").unwrap_or_else(|_| "/webhook".into());
+    if !webhook_path.starts_with('/') {
+        return Err(format!("WEBHOOK_PATH must start with '/'; got {webhook_path:?}").into());
+    }
+
     let app = Router::new()
-        .route("/webhook", post(webhook))
+        .route(&webhook_path, post(webhook))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
     let listener = TcpListener::bind(addr).await?;
-    eprintln!("gh-webhook-spool listening on {addr}");
+    eprintln!("gh-webhook-spool listening on {addr}, webhook path {webhook_path}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
