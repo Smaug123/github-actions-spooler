@@ -2,7 +2,21 @@
 
 Single-binary HMAC-verifying GitHub webhook receiver. Spools `workflow_job`
 queued events to a maildir-style on-disk queue for a downstream self-hosted
-runner provisioner. All source is in `src/main.rs`.
+runner provisioner.
+
+Source is split across `src/` by concern, in dependency order:
+
+- `fs_security.rs` — POSIX/Darwin filesystem-security primitives (`current_euid`,
+  `verify_ancestor_chain`, `verify_dir_secure`, `create_dir_secure`,
+  `O_NOFOLLOW`, the `darwin_acl` submodule).
+- `secret.rs` — HMAC secret loading (`load_secret`, `read_secret_file`,
+  `read_secret_open_fd`).
+- `spool.rs` — the maildir-style durable queue (`prepare_spool`, `sweep_tmp`,
+  `enqueue`, `EnqueueResult`, `Envelope`).
+- `webhook.rs` — the HTTP policy core (`process`), the axum handler, `Outcome`,
+  `AppState`, and the header/event validators.
+- `main.rs` — config constants (`ALLOWED_REPO_IDS`/`EXPECTED_LABELS`), `AppState`
+  wiring, and startup/serve.
 
 ## Commands
 
@@ -98,7 +112,8 @@ starts building for a target outside `linux` / `macos` / `ios` / `freebsd`
 
 ## Tests
 
-All tests live in `mod tests` in `src/main.rs`. `fresh_spool` builds a temp
-queue layout (skips the security verify path), `wfjob_body` builds a
-`workflow_job` payload, `tempdir_like` is the in-tree tempfile replacement.
-Don't add a `tempfile` dep for tests.
+Tests live in a per-module `#[cfg(test)] mod tests` block next to the code they
+exercise. Shared helpers are in `src/test_support.rs` (compiled only under
+`cfg(test)`): `fresh_spool` builds a temp queue layout (skips the security
+verify path), `wfjob_body` builds a `workflow_job` payload, `tempdir_like` is
+the in-tree tempfile replacement. Don't add a `tempfile` dep for tests.
