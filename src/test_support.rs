@@ -78,7 +78,13 @@ pub(crate) fn wfjob_body_full(
     }
     serde_json::to_vec(&serde_json::json!({
         "action": action,
-        "workflow_job": { "id": workflow_job_id, "labels": labels_json },
+        "workflow_job": {
+            "id": workflow_job_id,
+            "name": "all-required-checks-complete",
+            "head_branch": "main",
+            "head_sha": "1111111111111111111111111111111111111111",
+            "labels": labels_json,
+        },
         "repository": repo,
     }))
     .unwrap()

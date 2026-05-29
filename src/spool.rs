@@ -12,7 +12,11 @@ use tokio::io::AsyncWriteExt;
 
 use crate::fs_security::{create_dir_secure, darwin_acl, verify_ancestor_chain, verify_dir_secure};
 
-pub(crate) const ENVELOPE_SCHEMA: u32 = 1;
+// v2 added the advisory prioritization hints (head_branch, head_sha,
+// job_name). It's a purely additive change — a v1 consumer that ignores
+// unknown fields keeps working — but the bump lets a consumer assert "these
+// hints are present" rather than probing for them.
+pub(crate) const ENVELOPE_SCHEMA: u32 = 2;
 
 pub(crate) async fn prepare_spool(
     root: PathBuf,
@@ -98,8 +102,12 @@ async fn sweep_tmp(tmp: &Path) -> io::Result<()> {
 //      GitHub's HMAC and a local writer with the right uid/group could
 //      pair a valid (body, signature) with tampered envelope fields.
 //      Derive every trust-relevant field (repo_id, action,
-//      workflow_job.id, labels) from the HMAC-verified body, not from
-//      the envelope.
+//      workflow_job.id, labels, head_sha) from the HMAC-verified body, not
+//      from the envelope. The head_branch/head_sha/job_name hints exist so
+//      the consumer can order/prioritize the queue without parsing every
+//      body; sorting on a forged hint only reorders work, but anything that
+//      determines *what runs* (e.g. the sha you check out) must come from
+//      the verified body.
 //   2. Re-verify HMAC-SHA256 over the raw body using the consumer's own
 //      copy of the secret. The signature in the envelope can serve as the
 //      expected value (it's deterministic — HMAC(secret, body)), but the
@@ -119,6 +127,13 @@ pub(crate) struct Envelope<'a> {
     pub(crate) repo: &'a str,
     pub(crate) action: &'a str,
     pub(crate) workflow_job_id: u64,
+    // Advisory prioritization hints lifted from the verified body
+    // (workflow_job.head_branch / head_sha / name). Empty string when the
+    // field is absent or non-string. See the consumer-MUST note above:
+    // safe to sort on, never to trust.
+    pub(crate) head_branch: &'a str,
+    pub(crate) head_sha: &'a str,
+    pub(crate) job_name: &'a str,
     pub(crate) received_at_ms: u64,
     pub(crate) signature: &'a str,
 }

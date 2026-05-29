@@ -233,6 +233,24 @@ pub(crate) async fn process(state: &AppState, headers: &HeaderMap, body: &[u8]) 
         .and_then(|r| r.get("full_name"))
         .and_then(|n| n.as_str())
         .unwrap_or("");
+    // Advisory prioritization hints for the consumer. All three are inside
+    // the HMAC-verified body but are stored unauthenticated in the envelope
+    // (see the spool module's consumer-MUST note). job_name is
+    // workflow_job.name — the check/job name, which is what `needs:` graphs
+    // key on. Default to "" so a delivery missing any of them still enqueues.
+    let workflow_job = parsed.get("workflow_job");
+    let head_branch = workflow_job
+        .and_then(|j| j.get("head_branch"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let head_sha = workflow_job
+        .and_then(|j| j.get("head_sha"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let job_name = workflow_job
+        .and_then(|j| j.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let received_at_ms: u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -247,6 +265,9 @@ pub(crate) async fn process(state: &AppState, headers: &HeaderMap, body: &[u8]) 
         repo: repo_name,
         action,
         workflow_job_id,
+        head_branch,
+        head_sha,
+        job_name,
         received_at_ms,
         signature: &signature,
     };
@@ -356,13 +377,20 @@ mod tests {
         let nl = contents.iter().position(|&b| b == b'\n').unwrap();
         let envelope: serde_json::Value =
             serde_json::from_slice(&contents[..nl]).expect("envelope is json");
-        assert_eq!(envelope["schema"], 1);
+        assert_eq!(envelope["schema"], 2);
         assert_eq!(envelope["event"], "workflow_job");
         assert_eq!(envelope["delivery"], "deadbeef-0001");
         assert_eq!(envelope["repo_id"], 42);
         assert_eq!(envelope["repo"], "octo/cat");
         assert_eq!(envelope["action"], "queued");
         assert_eq!(envelope["workflow_job_id"], 1);
+        // Advisory prioritization hints, surfaced from the verified body.
+        assert_eq!(envelope["head_branch"], "main");
+        assert_eq!(
+            envelope["head_sha"],
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(envelope["job_name"], "all-required-checks-complete");
         assert_eq!(&contents[nl + 1..], body.as_slice());
 
         let mut tmp_entries = fs::read_dir(root.join("tmp")).await.unwrap();
@@ -397,6 +425,36 @@ mod tests {
             0o600,
             "spool file should be 0600"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_priority_hints_default_to_empty_strings() {
+        // A delivery that omits head_branch/head_sha/name still enqueues;
+        // the envelope just carries "" for the absent hints rather than
+        // failing or dropping the job.
+        let (_dir, root) = fresh_spool().await;
+        let state = state_with(&root, &[42], &[]);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "queued",
+            "workflow_job": { "id": 7, "labels": [] },
+            "repository": {
+                "id": 42,
+                "full_name": "octo/cat",
+                "private": true,
+                "visibility": "private"
+            }
+        }))
+        .unwrap();
+        let sig = sign(&state.secret, &body);
+        let h = headers("workflow_job", "no-hints", &sig);
+        assert_eq!(process(&state, &h, &body).await, Outcome::Accepted);
+
+        let contents = fs::read(root.join("new").join("7.job")).await.unwrap();
+        let nl = contents.iter().position(|&b| b == b'\n').unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&contents[..nl]).unwrap();
+        assert_eq!(envelope["head_branch"], "");
+        assert_eq!(envelope["head_sha"], "");
+        assert_eq!(envelope["job_name"], "");
     }
 
     #[tokio::test]

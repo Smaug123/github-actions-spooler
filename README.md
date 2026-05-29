@@ -147,21 +147,40 @@ Each accepted job is written to `<SPOOL_DIR>/new/{workflow_job_id}.job` as:
 <envelope JSON>\n<raw webhook body>
 ```
 
-Envelope (schema v1):
+Envelope (schema v2):
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "event": "workflow_job",
   "delivery": "deadbeef-1234",
   "repo_id": 123456789,
   "repo": "owner/repo",
   "action": "queued",
   "workflow_job_id": 987654321,
+  "head_branch": "main",
+  "head_sha": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b",
+  "job_name": "all-required-checks-complete",
   "received_at_ms": 1716643200000,
   "signature": "sha256=..."
 }
 ```
+
+`head_branch`, `head_sha`, and `job_name` (schema v2+) are **advisory
+prioritization hints** so the consumer can order the queue without parsing
+every body. They're lifted verbatim from `workflow_job.head_branch`,
+`workflow_job.head_sha`, and `workflow_job.name` in the verified body —
+`job_name` is the check/job name, i.e. what GitHub Actions `needs:` graphs
+key on, so a consumer can prefer cheap unblocking jobs. Each defaults to
+`""` if the delivery omits it. **They are not re-authenticated on the
+filesystem side** (see "Consumer requirements"): sorting on a forged hint
+only reorders work, but anything that decides *what runs* must be re-derived
+from the body. Schema v2 is purely additive — a v1 consumer that ignores
+unknown fields keeps working.
+
+The filename is still `{workflow_job_id}.job` — all the new metadata lives
+in the file, so existing consumers and the dedup/idempotency contract are
+unaffected.
 
 The filename uses `workflow_job_id` because it's an **authenticated**
 field — GitHub's HMAC covers the body, not the `X-GitHub-Delivery`
@@ -190,9 +209,12 @@ The consumer running against `<SPOOL_DIR>/new/` MUST therefore:
    "does `HMAC(my-secret, raw-body)` match". If it doesn't, discard.
 3. **Derive every trust-relevant field from the verified body**, not
    from the envelope. That includes `repo_id`, `action`,
-   `workflow_job.id`, and `labels`. Treat envelope fields like
-   `received_at_ms` and `repo` (the human-readable name) as advisory
-   metadata only.
+   `workflow_job.id`, `labels`, and `head_sha` if you use it to decide
+   what code to run. Treat envelope fields like `received_at_ms`, `repo`
+   (the human-readable name), and the `head_branch`/`head_sha`/`job_name`
+   prioritization hints as advisory metadata only — fine to sort on, but a
+   local writer could forge them, so re-read anything load-bearing from the
+   body.
 4. **Reject envelope/filename/body mismatches.** If the filename's
    numeric stem doesn't match `workflow_job.id` parsed from the verified
    body, the file is forged — discard.
