@@ -94,7 +94,7 @@ that no other runner pool uses.
 | `GH_WEBHOOK_SECRET`         | Shared secret string. Discouraged: env vars are visible via `/proc/PID/environ`. Setting both this and `_FILE` is a startup error — pick one. |
 | `SPOOL_DIR`                 | Queue root (absolute path). `tmp/` and `new/` are auto-created. |
 | `LISTEN_ADDR`               | Bind address. Default `127.0.0.1:8080`.              |
-| `WEBHOOK_PATH`              | Route the handler is mounted on. Default `/webhook`. Set this to match the GitHub App's webhook URL path (e.g. a hard-to-guess `/github/<uuid>`) so no reverse-proxy rewrite is needed. Must start with `/`. The path is not a security boundary — the HMAC is. |
+| `WEBHOOK_PATH`              | Route the handler is mounted on. Default `/webhook`. Set this to match the GitHub App's webhook URL path (e.g. a hard-to-guess `/github/<uuid>`) so no reverse-proxy rewrite is needed. Must be a **literal** path starting with `/`, matched verbatim — it is *not* an axum route pattern, so `:name`/`*name` segments are not captures/wildcards. Startup is refused if it contains `:` or `*`. The path is not a security boundary — the HMAC is. |
 | `ALLOW_NON_LOOPBACK_BIND`   | Set to `1` to permit a non-loopback `LISTEN_ADDR`. Without this the binary refuses to start, because the threat model assumes loopback-only ingress behind a TLS proxy. |
 
 The secret (from either source) must be ≥16 bytes after trailing CR/LF

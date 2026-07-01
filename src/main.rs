@@ -177,12 +177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The route the handler is mounted on. Configurable so the deployment can
     // match whatever path the GitHub App's webhook URL uses (e.g. a hard-to-
     // guess `/github/<uuid>`); the path is not a security boundary — the HMAC
-    // is — but matching it avoids a reverse-proxy rewrite. axum requires a
-    // leading slash, so reject anything else loudly at startup.
+    // is — but matching it avoids a reverse-proxy rewrite. It is mounted
+    // verbatim as a literal route (see validate_webhook_path), so reject
+    // anything that isn't loudly at startup.
     let webhook_path = std::env::var("WEBHOOK_PATH").unwrap_or_else(|_| "/webhook".into());
-    if !webhook_path.starts_with('/') {
-        return Err(format!("WEBHOOK_PATH must start with '/'; got {webhook_path:?}").into());
-    }
+    validate_webhook_path(&webhook_path)?;
 
     let app = Router::new()
         .route(&webhook_path, post(webhook))
@@ -194,6 +193,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    Ok(())
+}
+
+/// Validate WEBHOOK_PATH and accept it only if it is a *literal* path that
+/// axum will mount verbatim. axum 0.7 (matchit 0.7) treats a `:name` segment
+/// as a named capture and a `*name` segment as a catch-all: `/github/:uuid`
+/// would match `/github/anything` rather than the literal segment the operator
+/// intended, and a malformed pattern panics inside `Router::route` at startup.
+/// `:` and `*` are matchit's complete metacharacter set, so a leading-slash
+/// path containing neither is a purely static route — matched exactly and safe
+/// to insert. A real hard-to-guess `/github/<uuid>` path contains neither, so
+/// rejecting them costs nothing and turns a silent-mismatch / startup-panic
+/// footgun into a clear config error.
+fn validate_webhook_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("WEBHOOK_PATH must start with '/'; got {path:?}"));
+    }
+    if let Some(c) = path.chars().find(|&c| c == ':' || c == '*') {
+        return Err(format!(
+            "WEBHOOK_PATH must be a literal path but contains {c:?}: axum 0.7 \
+             treats a ':name'/'*name' segment as a capture/catch-all, so \
+             {path:?} would not match literally (and a malformed pattern panics \
+             at startup). Use a path with no ':' or '*'."
+        ));
+    }
     Ok(())
 }
 
@@ -213,5 +237,119 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = term => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // Mounting `path` on a fresh Router must not panic. This is the invariant
+    // validate_webhook_path exists to guarantee: axum's `Router::route` panics
+    // on a malformed pattern, so "accepted => never panics at startup" is the
+    // property we actually care about. catch_unwind because the failure mode is
+    // a panic, not an error return.
+    fn route_panics(path: &str) -> bool {
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = Router::<()>::new().route(path, post(|| async {}));
+        }))
+        .is_err()
+    }
+
+    #[test]
+    fn default_and_literal_paths_are_accepted() {
+        for p in [
+            "/webhook",
+            "/",
+            "/github/3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            "/a/b/c",
+            "/deeply/nested/literal_path-1",
+        ] {
+            assert!(validate_webhook_path(p).is_ok(), "should accept {p:?}");
+        }
+    }
+
+    #[test]
+    fn missing_leading_slash_is_rejected() {
+        for p in ["", "webhook", "github/x", ":x", "*x"] {
+            assert!(validate_webhook_path(p).is_err(), "should reject {p:?}");
+        }
+    }
+
+    #[test]
+    fn capture_and_wildcard_segments_are_rejected() {
+        for p in [
+            "/github/:uuid",
+            "/:x",
+            "/a/:b/c",
+            "/github/*rest",
+            "/*",
+            "/a/*catchall",
+            "/mix/:a/*b",
+        ] {
+            assert!(validate_webhook_path(p).is_err(), "should reject {p:?}");
+        }
+    }
+
+    // A ':'/'*' anywhere is conservatively rejected, even mid-segment where
+    // matchit might treat it as literal — the rule is "no metacharacters at
+    // all", which is simpler to reason about and loses no legitimate path.
+    #[test]
+    fn metacharacters_anywhere_are_rejected() {
+        for p in ["/foo:bar", "/foo*bar", "/a/b:c/d", "/a/b*c/d"] {
+            assert!(validate_webhook_path(p).is_err(), "should reject {p:?}");
+        }
+    }
+
+    // Deterministic sweep over generated paths, exercising both directions of
+    // the invariant with no PBT dependency:
+    //   * every accepted (literal) path mounts on a Router without panicking;
+    //   * prefixing the first segment with ':'/'*' flips it to Err.
+    #[test]
+    fn accepted_paths_never_panic_the_router() {
+        const ALPHABET: &[u8] = b"abz09_-/";
+        // A small LCG gives reproducible pseudo-random strings without needing
+        // Math.random-style nondeterminism (which would break test replay).
+        let mut lcg: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as usize
+        };
+
+        for _ in 0..4000 {
+            let len = 1 + next() % 12;
+            let mut body: String = (0..len)
+                .map(|_| ALPHABET[next() % ALPHABET.len()] as char)
+                .collect();
+            let path = format!("/{body}");
+
+            // Literal path: validator accepts AND the real router accepts it.
+            assert!(
+                validate_webhook_path(&path).is_ok(),
+                "validator rejected literal path {path:?}"
+            );
+            assert!(
+                !route_panics(&path),
+                "Router::route panicked on validator-accepted path {path:?}"
+            );
+
+            // Now make it a capture/wildcard at a segment head: must be rejected.
+            body.insert(0, ':');
+            let captured = format!("/{body}");
+            assert!(
+                validate_webhook_path(&captured).is_err(),
+                "validator accepted capture path {captured:?}"
+            );
+            body.remove(0);
+            body.insert(0, '*');
+            let wildcarded = format!("/{body}");
+            assert!(
+                validate_webhook_path(&wildcarded).is_err(),
+                "validator accepted wildcard path {wildcarded:?}"
+            );
+        }
     }
 }
