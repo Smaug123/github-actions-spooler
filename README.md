@@ -131,7 +131,12 @@ gh-webhook-spool
 Anything else gets 200 with no enqueue. HMAC failures are 401; charset
 and content-type failures are 400. An enqueue I/O failure returns 500,
 and a concurrent retry that arrives while an earlier write is still
-in flight returns 503.
+in flight returns 503. Two responses come from the framework before the
+handler runs: a body over the 5 MiB cap is rejected with 413, and a
+non-`POST` request to the webhook path gets 405. (A `workflow_job`
+payload is tens of KB, so 413 shouldn't occur in practice — but note
+that, being deterministic in the body, it would fail every redelivery
+attempt, so a failed-delivery monitor must not retry it forever.)
 
 **GitHub does not automatically redeliver failed webhook deliveries**
 ([docs](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries)).
