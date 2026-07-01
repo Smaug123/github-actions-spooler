@@ -21,6 +21,31 @@ pub(crate) const ENVELOPE_SCHEMA: u32 = 2;
 pub(crate) async fn prepare_spool(
     root: PathBuf,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    // Reject a symlinked SPOOL_DIR before anything touches it. canonicalize()
+    // below follows every symlink in the path, so without this check a
+    // symlinked root would be silently accepted and every downstream check
+    // would apply to the resolved target — making the documented "SPOOL_DIR
+    // ... must be real directories (no symlinks)" contract vacuous for the
+    // root, even though tmp/ and new/ already get this rejection via
+    // symlink_metadata in verify_dir_secure. A not-yet-existing root is created
+    // as a real directory by create_dir_secure below, so only a pre-existing
+    // symlink can trip this; a NotFound (or other) stat error falls through to
+    // create_dir_secure/canonicalize, which surface a clearer error.
+    //
+    // lstat()/symlink_metadata() follows a *final* symlink when the path
+    // carries a trailing slash (POSIX: the slash demands directory
+    // resolution), so a "/var/spool/link/"-style value — trailing slashes are
+    // common in directory env vars — would slip past a naive check. Strip
+    // trailing separators via components().as_path() so we lstat the final
+    // component itself.
+    let root_stem = root.components().as_path();
+    if std::fs::symlink_metadata(root_stem).is_ok_and(|md| md.file_type().is_symlink()) {
+        return Err(format!(
+            "SPOOL_DIR {} is a symlink; spool components must be real directories (no symlinks)",
+            root.display()
+        )
+        .into());
+    }
     create_dir_secure(&root).await?;
     // Canonicalize after the root exists so verify_ancestor_chain walks the
     // real ancestors rather than textual `..`-laden ones. canonicalize
@@ -280,6 +305,47 @@ pub(crate) async fn enqueue(
 mod tests {
     use super::*;
     use crate::test_support::fresh_spool;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_spool_rejects_symlinked_root() {
+        // A symlinked SPOOL_DIR must be rejected outright rather than silently
+        // resolved to its target by canonicalize(). Otherwise the documented
+        // "SPOOL_DIR ... must be real directories (no symlinks)" contract is
+        // vacuous for the root, even though tmp/ and new/ already get the
+        // symlink rejection via verify_dir_secure. The trailing-slash form
+        // must be rejected too: lstat() follows a final symlink when the path
+        // ends in '/', so the guard normalizes the separator away first.
+        use crate::test_support::tempdir_like;
+        let outer = tempdir_like::TempDir::new("spool-symlink").unwrap();
+        let target = outer.path().join("real-root");
+        std::fs::create_dir(&target).unwrap();
+        let link = outer.path().join("link-root");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let with_slash = PathBuf::from(format!("{}/", link.display()));
+        for root in [link.clone(), with_slash] {
+            let err = prepare_spool(root.clone())
+                .await
+                .expect_err("a symlinked SPOOL_DIR must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("symlink"),
+                "error should name the symlink rejection for {root:?}, got: {msg}"
+            );
+        }
+
+        // The rejection must fire before anything is written through the link,
+        // so the target is left untouched by either form.
+        assert!(
+            !target.join("tmp").exists(),
+            "tmp/ must not be created via the symlink"
+        );
+        assert!(
+            !target.join("new").exists(),
+            "new/ must not be created via the symlink"
+        );
+    }
 
     #[tokio::test]
     async fn enqueue_writes_to_new_and_acks_duplicate_on_repeat() {
