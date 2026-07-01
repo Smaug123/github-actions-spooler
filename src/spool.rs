@@ -48,6 +48,15 @@ pub(crate) async fn prepare_spool(
     Ok(root)
 }
 
+// Make prior rename/unlink operations in `dir` durable by fsyncing the
+// directory itself. tokio doesn't expose directory fsync, so do it on the
+// blocking pool.
+async fn fsync_dir(dir: PathBuf) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || -> io::Result<()> { std::fs::File::open(&dir)?.sync_all() })
+        .await
+        .map_err(io::Error::other)?
+}
+
 async fn sweep_tmp(tmp: &Path) -> io::Result<()> {
     let mut entries = fs::read_dir(tmp).await?;
     let mut swept_any = false;
@@ -75,13 +84,7 @@ async fn sweep_tmp(tmp: &Path) -> io::Result<()> {
     if swept_any {
         // Make the unlinks durable so a crash right after sweep doesn't
         // leave the same files there for the next startup to re-sweep.
-        let tmp_owned = tmp.to_path_buf();
-        tokio::task::spawn_blocking(move || -> io::Result<()> {
-            let dir = std::fs::File::open(&tmp_owned)?;
-            dir.sync_all()
-        })
-        .await
-        .map_err(io::Error::other)??;
+        fsync_dir(tmp.to_path_buf()).await?;
     }
     // A leftover tmp/{id}.job (or a stale directory) we couldn't remove would
     // pin every future delivery for that id at InFlight/503 until manual
@@ -191,6 +194,13 @@ pub(crate) async fn enqueue(
     // (received_at_ms, delivery, and potentially signature/repo all
     // differ) so the file is NOT byte-identical across writes.
     if fs::metadata(&new_path).await.is_ok() {
+        // A prior request may have renamed new/{id} into place but died (e.g.
+        // via a failed directory fsync -> 500) before that rename was durable.
+        // fsync new/ now so acking Duplicate honours the "2xx == durably
+        // queued" contract; if the fsync fails we surface 500 and the next
+        // redelivery retries it — turning the retry into the recovery the
+        // original 500 asked for.
+        fsync_dir(spool_dir.join("new")).await?;
         return Ok(EnqueueResult::Duplicate);
     }
 
@@ -214,6 +224,10 @@ pub(crate) async fn enqueue(
             // caller can ask GitHub to retry without claiming a real
             // I/O failure happened.
             if fs::metadata(&new_path).await.is_ok() {
+                // Same durability reasoning as the pre-open fast path: fsync
+                // new/ before acking Duplicate so a not-yet-durable rename by
+                // the other writer can't be lost behind a 200.
+                fsync_dir(spool_dir.join("new")).await?;
                 return Ok(EnqueueResult::Duplicate);
             }
             return Ok(EnqueueResult::InFlight);
@@ -257,14 +271,7 @@ pub(crate) async fn enqueue(
     }
 
     // Make the rename itself durable by fsyncing the containing directory.
-    // tokio doesn't expose directory fsync; do it on the blocking pool.
-    let new_dir = spool_dir.join("new");
-    tokio::task::spawn_blocking(move || -> io::Result<()> {
-        let dir = std::fs::File::open(&new_dir)?;
-        dir.sync_all()
-    })
-    .await
-    .map_err(io::Error::other)??;
+    fsync_dir(spool_dir.join("new")).await?;
 
     Ok(EnqueueResult::Wrote)
 }
