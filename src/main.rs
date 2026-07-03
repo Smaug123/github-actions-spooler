@@ -84,6 +84,7 @@ compile_error!(
 );
 
 mod fs_security;
+mod launchd;
 mod secret;
 mod spool;
 mod webhook;
@@ -153,26 +154,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         expected_labels,
     });
 
-    let listen = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let addr: SocketAddr = listen.parse()?;
-    if !addr.ip().is_loopback() {
-        // The whole threat model assumes loopback-only ingress: no rate
-        // limiting, no TLS, no IP allowlisting in this binary. Fail loud
-        // rather than warn-and-bind, otherwise a typo in LISTEN_ADDR
-        // exposes a raw HTTP handler to the network.
-        let allow = std::env::var("ALLOW_NON_LOOPBACK_BIND")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if !allow {
-            return Err(format!(
-                "refusing to bind {addr}: this binary expects to sit behind a TLS reverse proxy on loopback. \
-                 Set ALLOW_NON_LOOPBACK_BIND=1 to override (only when an external network policy guarantees \
-                 nothing untrusted can reach the listener)."
-            )
-            .into());
-        }
-        eprintln!("warning: binding {addr} per ALLOW_NON_LOOPBACK_BIND=1");
-    }
+    // A non-loopback listener requires an explicit override no matter how the
+    // socket is obtained — whether we bind it or launchd hands it to us. Read
+    // the flag once; both acquisition paths below enforce the same gate.
+    let allow_non_loopback = std::env::var("ALLOW_NON_LOOPBACK_BIND")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     // The route the handler is mounted on. Configurable so the deployment can
     // match whatever path the GitHub App's webhook URL uses (e.g. a hard-to-
@@ -188,8 +175,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
-    let listener = TcpListener::bind(addr).await?;
-    eprintln!("gh-webhook-spool listening on {addr}, webhook path {webhook_path}");
+    // Acquire the listening socket. Two mutually exclusive modes:
+    //   * LAUNCHD_SOCKET_NAME set -> adopt the socket launchd created for that
+    //     `Sockets` entry (macOS socket activation). launchd owns the socket
+    //     across restarts, so the kernel queues connections in the accept
+    //     backlog while we're down: `launchctl kickstart -k` drops zero
+    //     deliveries — which matters because GitHub never auto-redelivers a
+    //     failed webhook. LISTEN_ADDR is ignored here; the bind address lives
+    //     in the plist, and the loopback gate is re-enforced on the inherited
+    //     socket via getsockname (see launchd::adopt_listener_fd).
+    //   * unset -> bind LISTEN_ADDR ourselves (default 127.0.0.1:8080), the
+    //     mode used for `cargo run`, the tests, and non-launchd hosts.
+    // No silent fallback: a present-but-empty/non-UTF-8 LAUNCHD_SOCKET_NAME, or
+    // one whose activation fails, refuses to start rather than quietly binding
+    // a fresh socket and losing zero-drop. `socket_mode` decides unset vs.
+    // empty vs. set (see its unit tests).
+    let (listener, bound_addr, mode) =
+        match launchd::socket_mode(std::env::var("LAUNCHD_SOCKET_NAME"))? {
+            launchd::SocketMode::Activate(name) => {
+                let (l, addr) = launchd::listener_from_launchd(&name, allow_non_loopback)
+                    .map_err(|e| format!("LAUNCHD_SOCKET_NAME={name:?}: {e}"))?;
+                (l, addr, "launchd socket activation")
+            }
+            launchd::SocketMode::SelfBind => {
+                let listen =
+                    std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+                let addr: SocketAddr = listen.parse()?;
+                launchd::check_loopback(&addr, allow_non_loopback)?;
+                let l = TcpListener::bind(addr).await?;
+                (l, addr, "self-bound")
+            }
+        };
+    eprintln!("gh-webhook-spool listening on {bound_addr} ({mode}), webhook path {webhook_path}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
