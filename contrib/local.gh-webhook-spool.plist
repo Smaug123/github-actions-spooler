@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sample launchd job for gh-webhook-spool using socket activation.
+
+  launchd owns the listening socket declared in the `Sockets` dict below and
+  hands it to the process via launch_activate_socket("Listener"). Because
+  launchd holds the socket for the lifetime of the job configuration, the
+  kernel keeps queueing incoming connections in the accept backlog while the
+  process is down, so an upgrade —
+
+      ln -sfn /nix/store/<new-hash>/bin/gh-webhook-spool /usr/local/bin/gh-webhook-spool
+      launchctl kickstart -k system/local.gh-webhook-spool
+
+  — drops zero deliveries. That matters because GitHub does NOT auto-redeliver
+  a failed webhook: a connection refused during a plain-bind restart would be a
+  permanently lost job.
+
+  Install (as root, system domain):
+      install -m 0644 contrib/local.gh-webhook-spool.plist /Library/LaunchDaemons/
+      launchctl bootstrap system /Library/LaunchDaemons/local.gh-webhook-spool.plist
+
+  Replace the bracketed/REPLACE values before use, and create the
+  `gh-webhook-spool` user that owns SPOOL_DIR and the secret file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.gh-webhook-spool</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/gh-webhook-spool</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Must match the key in the Sockets dict below. Setting this is what
+             switches the binary from self-bind to socket activation. -->
+        <key>LAUNCHD_SOCKET_NAME</key>
+        <string>Listener</string>
+        <key>GH_WEBHOOK_SECRET_FILE</key>
+        <string>/etc/gh-webhook-spool/secret</string>
+        <key>SPOOL_DIR</key>
+        <string>/var/spool/gh-webhook-spool</string>
+        <!-- Match the path in the GitHub App's webhook URL. -->
+        <key>WEBHOOK_PATH</key>
+        <string>/github/REPLACE-WITH-A-UUID</string>
+    </dict>
+
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <!-- A numeric loopback SockNodeName yields exactly one socket. A
+                 hostname that resolves to both IPv4 and IPv6 would yield two,
+                 which the binary refuses (it serves a single listener). -->
+            <key>SockType</key>
+            <string>stream</string>
+            <key>SockNodeName</key>
+            <string>127.0.0.1</string>
+            <key>SockServiceName</key>
+            <string>8080</string>
+        </dict>
+    </dict>
+
+    <!-- Keep the receiver running (it sits behind a proxy, always on). With a
+         Sockets entry launchd still owns the socket across restarts, so
+         kickstart -k stays zero-drop. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Run as a dedicated unprivileged user that owns SPOOL_DIR and the secret
+         file. Do NOT run this as root: the filesystem checks are euid-based. -->
+    <key>UserName</key>
+    <string>gh-webhook-spool</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/gh-webhook-spool.log</string>
+</dict>
+</plist>

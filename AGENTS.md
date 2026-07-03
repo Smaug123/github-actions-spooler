@@ -15,8 +15,13 @@ Source is split across `src/` by concern, in dependency order:
   `enqueue`, `EnqueueResult`, `Envelope`).
 - `webhook.rs` — the HTTP policy core (`process`), the axum handler, `Outcome`,
   `AppState`, and the header/event validators.
+- `launchd.rs` — listening-socket acquisition. `check_loopback` (the shared
+  loopback gate), `adopt_listener_fd` (adopt an inherited fd, re-check loopback
+  via `getsockname`, hand to tokio), and `listener_from_launchd` (macOS
+  `launch_activate_socket` FFI; a stub that errors on other targets). Opt-in via
+  `LAUNCHD_SOCKET_NAME`; no silent fallback.
 - `main.rs` — config constants (`ALLOWED_REPO_IDS`/`EXPECTED_LABELS`), `AppState`
-  wiring, and startup/serve.
+  wiring, and startup/serve (dispatches self-bind vs. socket activation).
 
 ## Commands
 
@@ -95,8 +100,14 @@ nix build              # release binary via the flake
    verified bytes are the ones returned — closing the stat-then-read
    TOCTOU. Same hygiene as the spool dir because the secret bears the
    entire forge boundary.
-10. `LISTEN_ADDR` non-loopback requires `ALLOW_NON_LOOPBACK_BIND=1`. The
-    threat model assumes loopback-only ingress.
+10. Loopback-only ingress. A non-loopback listener requires
+    `ALLOW_NON_LOOPBACK_BIND=1`, and the check is enforced on **both**
+    acquisition paths through the single `launchd::check_loopback`: the
+    self-bound `LISTEN_ADDR`, and — when `LAUNCHD_SOCKET_NAME` selects socket
+    activation — the address the inherited socket is actually bound to, read
+    back via `getsockname` (`local_addr`) since the process no longer chooses
+    it. Activation is opt-in and fail-loud: a set-but-failing
+    `LAUNCHD_SOCKET_NAME` refuses to start rather than silently self-binding.
 11. Envelope schema bumps are breaking changes for the consumer — bump
     the `ENVELOPE_SCHEMA` constant and coordinate.
 
