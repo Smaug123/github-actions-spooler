@@ -171,11 +171,9 @@ fn activate_socket(name: &str) -> io::Result<Vec<RawFd>> {
     }
 
     // SAFETY: on success launchd wrote `cnt` valid descriptors to the malloc'd
-    // array at `fds`.
-    let out: Vec<RawFd> = unsafe { std::slice::from_raw_parts(fds, cnt) }
-        .iter()
-        .map(|&fd| fd as RawFd)
-        .collect();
+    // array at `fds`. RawFd is a type alias for c_int on unix, so the slice is
+    // already &[RawFd]; to_vec copies the descriptors out (no cast needed).
+    let out: Vec<RawFd> = unsafe { std::slice::from_raw_parts(fds, cnt) }.to_vec();
     // SAFETY: `fds` was allocated by launchd with malloc; we own it and have
     // copied every descriptor out, so freeing it now leaks nothing and the
     // descriptors stay open.
