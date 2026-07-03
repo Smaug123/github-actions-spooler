@@ -94,7 +94,7 @@ that no other runner pool uses.
 | `GH_WEBHOOK_SECRET`         | Shared secret string. Discouraged: env vars are visible via `/proc/PID/environ`. Setting both this and `_FILE` is a startup error — pick one. |
 | `SPOOL_DIR`                 | Queue root (absolute path). `tmp/` and `new/` are auto-created. |
 | `LISTEN_ADDR`               | Bind address. Default `127.0.0.1:8080`. **Ignored when `LAUNCHD_SOCKET_NAME` is set** — the bind address then comes from the plist. |
-| `LAUNCHD_SOCKET_NAME`       | macOS only. Set to the key of an entry in the launchd job's `Sockets` dict to take that socket from launchd (socket activation) instead of binding one. Enables zero-drop restarts (see *Operations → Zero-downtime restarts*). Unset ⇒ the binary binds `LISTEN_ADDR` itself. If set but activation fails, startup is refused (no silent fallback). The loopback check still applies, re-derived from the inherited socket's own address. |
+| `LAUNCHD_SOCKET_NAME`       | macOS only. Set to the key of an entry in the launchd job's `Sockets` dict to take that socket from launchd (socket activation) instead of binding one. Enables zero-drop restarts (see *Operations → Zero-downtime restarts*). **Unset** ⇒ the binary binds `LISTEN_ADDR` itself. A **present-but-empty** value (or one whose activation fails) refuses startup — it is a configuration error, not the same as unset (no silent fallback). The loopback check still applies, re-derived from the inherited socket's own address. |
 | `WEBHOOK_PATH`              | Route the handler is mounted on. Default `/webhook`. Set this to match the GitHub App's webhook URL path (e.g. a hard-to-guess `/github/<uuid>`) so no reverse-proxy rewrite is needed. Must be a **literal** path starting with `/`, matched verbatim — it is *not* an axum route pattern, so `:name`/`*name` segments are not captures/wildcards. Startup is refused if it contains `:` or `*`. The path is not a security boundary — the HMAC is. |
 | `ALLOW_NON_LOOPBACK_BIND`   | Set to `1` to permit a non-loopback `LISTEN_ADDR`. Without this the binary refuses to start, because the threat model assumes loopback-only ingress behind a TLS proxy. |
 
@@ -272,10 +272,11 @@ Notes:
   re-derived from the inherited socket's own address via `getsockname`. A
   non-loopback activated socket is refused unless `ALLOW_NON_LOOPBACK_BIND=1`,
   exactly as for a self-bound one.
-- There is **no silent fallback**: if `LAUNCHD_SOCKET_NAME` is set and
-  activation fails (wrong name, not launchd-managed, non-macOS), the binary
-  refuses to start rather than quietly bind a fresh socket and lose the
-  zero-drop property.
+- There is **no silent fallback**: if `LAUNCHD_SOCKET_NAME` is present but
+  empty/non-UTF-8, or is set and activation fails (wrong name, not
+  launchd-managed, non-macOS), the binary refuses to start rather than quietly
+  bind a fresh socket and lose the zero-drop property. Only a genuinely *unset*
+  variable self-binds.
 - Socket activation closes the *planned-restart* window. It does not replace a
   redelivery/reconciliation monitor for *unplanned* outages (see *Failed
   deliveries* below) — the two are complementary.

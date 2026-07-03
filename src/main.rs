@@ -184,24 +184,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //     failed webhook. LISTEN_ADDR is ignored here; the bind address lives
     //     in the plist, and the loopback gate is re-enforced on the inherited
     //     socket via getsockname (see launchd::adopt_listener_fd).
-    //   * otherwise -> bind LISTEN_ADDR ourselves (default 127.0.0.1:8080),
-    //     the mode used for `cargo run`, the tests, and non-launchd hosts.
-    // No silent fallback: a set-but-failing LAUNCHD_SOCKET_NAME refuses to
-    // start rather than quietly binding a fresh socket and losing zero-drop.
-    let (listener, bound_addr, mode) = match std::env::var("LAUNCHD_SOCKET_NAME") {
-        Ok(name) if !name.is_empty() => {
-            let (l, addr) = launchd::listener_from_launchd(&name, allow_non_loopback)
-                .map_err(|e| format!("LAUNCHD_SOCKET_NAME={name:?}: {e}"))?;
-            (l, addr, "launchd socket activation")
-        }
-        _ => {
-            let listen = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-            let addr: SocketAddr = listen.parse()?;
-            launchd::check_loopback(&addr, allow_non_loopback)?;
-            let l = TcpListener::bind(addr).await?;
-            (l, addr, "self-bound")
-        }
-    };
+    //   * unset -> bind LISTEN_ADDR ourselves (default 127.0.0.1:8080), the
+    //     mode used for `cargo run`, the tests, and non-launchd hosts.
+    // No silent fallback: a present-but-empty/non-UTF-8 LAUNCHD_SOCKET_NAME, or
+    // one whose activation fails, refuses to start rather than quietly binding
+    // a fresh socket and losing zero-drop. `socket_mode` decides unset vs.
+    // empty vs. set (see its unit tests).
+    let (listener, bound_addr, mode) =
+        match launchd::socket_mode(std::env::var("LAUNCHD_SOCKET_NAME"))? {
+            launchd::SocketMode::Activate(name) => {
+                let (l, addr) = launchd::listener_from_launchd(&name, allow_non_loopback)
+                    .map_err(|e| format!("LAUNCHD_SOCKET_NAME={name:?}: {e}"))?;
+                (l, addr, "launchd socket activation")
+            }
+            launchd::SocketMode::SelfBind => {
+                let listen =
+                    std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+                let addr: SocketAddr = listen.parse()?;
+                launchd::check_loopback(&addr, allow_non_loopback)?;
+                let l = TcpListener::bind(addr).await?;
+                (l, addr, "self-bound")
+            }
+        };
     eprintln!("gh-webhook-spool listening on {bound_addr} ({mode}), webhook path {webhook_path}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

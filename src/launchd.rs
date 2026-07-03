@@ -56,6 +56,46 @@ pub(crate) fn check_loopback(addr: &SocketAddr, allow_non_loopback: bool) -> Res
     ))
 }
 
+/// How to obtain the listening socket, decided purely from the
+/// LAUNCHD_SOCKET_NAME environment variable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SocketMode {
+    /// Adopt the launchd `Sockets` entry with this (non-empty) name.
+    Activate(String),
+    /// LAUNCHD_SOCKET_NAME is unset: bind LISTEN_ADDR ourselves.
+    SelfBind,
+}
+
+/// Interpret the LAUNCHD_SOCKET_NAME env var (pass `std::env::var(..)` straight
+/// in). Factored out of `main` so the fail-loud contract is unit-testable
+/// without binding a socket:
+///
+/// - unset -> SelfBind (dev, tests, non-launchd hosts);
+/// - a non-empty name -> Activate(name);
+/// - present-but-empty, or non-UTF-8 -> Err.
+///
+/// A present value means the operator configured *something*, so an unusable
+/// one is a misconfiguration to reject loudly, NOT a silent fall-back to
+/// self-binding — a plist typo like an empty `<string/>` would otherwise
+/// quietly forfeit zero-drop restarts and let planned restarts drop deliveries
+/// with no error.
+pub(crate) fn socket_mode(var: Result<String, std::env::VarError>) -> Result<SocketMode, String> {
+    match var {
+        Ok(name) if !name.is_empty() => Ok(SocketMode::Activate(name)),
+        Ok(_) => Err(
+            "LAUNCHD_SOCKET_NAME is set but empty. Unset it to bind LISTEN_ADDR \
+                      yourself, or set it to the key of the plist's `Sockets` entry."
+                .to_string(),
+        ),
+        Err(std::env::VarError::NotPresent) => Ok(SocketMode::SelfBind),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "LAUNCHD_SOCKET_NAME is set to a non-UTF-8 value; it must be the plist's \
+                 `Sockets` entry key."
+                .to_string(),
+        ),
+    }
+}
+
 /// Adopt an already-open listening socket `fd`, re-enforce the loopback gate on
 /// the address it is actually bound to, and hand it to tokio. This is the
 /// testable heart of socket activation: it needs no launchd, only a live
@@ -248,6 +288,40 @@ mod tests {
             assert!(check_loopback(&a, false).is_err(), "{s} must be refused");
             assert!(check_loopback(&a, true).is_ok(), "{s} must pass forced");
         }
+    }
+
+    #[test]
+    fn socket_mode_named_activates() {
+        assert_eq!(
+            socket_mode(Ok("Listener".to_string())),
+            Ok(SocketMode::Activate("Listener".to_string()))
+        );
+    }
+
+    #[test]
+    fn socket_mode_unset_self_binds() {
+        // Only a truly-unset variable falls back to self-bind — the dev, test,
+        // and non-launchd path.
+        assert_eq!(
+            socket_mode(Err(std::env::VarError::NotPresent)),
+            Ok(SocketMode::SelfBind)
+        );
+    }
+
+    #[test]
+    fn socket_mode_present_but_empty_is_an_error() {
+        // Regression: a present-but-empty LAUNCHD_SOCKET_NAME (e.g. a plist typo
+        // with an empty <string/>) must fail loud, not silently self-bind and
+        // quietly disable zero-drop restarts.
+        assert!(socket_mode(Ok(String::new())).is_err());
+    }
+
+    #[test]
+    fn socket_mode_non_utf8_is_an_error() {
+        // A set-but-non-UTF-8 value is likewise a misconfiguration, not "unset".
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert!(socket_mode(Err(std::env::VarError::NotUnicode(bad))).is_err());
     }
 
     // Adopting the fd of a real loopback listener must yield a listener that is
